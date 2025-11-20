@@ -210,10 +210,11 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}, LR: {lr:.6f}, EMA: {current_ema_m:.4f}, Time: {epoch_time:.2f}s")
 
         # k-NN evaluation and checkpoint saving
+        # DINO paper: evaluate on teacher EMA model only, using [cls] token
         knn_acc = None
         if (epoch + 1) % knn_eval_freq == 0 or (epoch + 1) == num_epochs:
-            knn_acc = knn_evaluate(student, knn_train_loader, knn_test_loader, k=20, device=device)
-            print(f"--- Epoch {epoch+1}, k-NN Accuracy: {knn_acc:.2f}% ---")
+            knn_acc = knn_evaluate(teacher, knn_train_loader, knn_test_loader, k=20, device=device)
+            print(f"--- Epoch {epoch+1}, k-NN Accuracy (teacher): {knn_acc:.2f}% ---")
             
             # Save best model
             if knn_acc > best_knn_acc:
@@ -541,10 +542,10 @@ if __name__ == '__main__':
     num_cores = os.cpu_count() or 2
     print(f"Using {num_cores} workers for DataLoaders.")
 
-    # Batch size for better GPU (A100 40GB or similar)
-    # With only 5k images, smaller batch size gives more gradient updates per epoch
-    # batch_size=128 gives ~39 batches/epoch, batch_size=256 gives only ~19 batches/epoch
-    batch_size = 128  # Good balance: uses GPU efficiently while getting enough updates per epoch
+    # Batch size: adjust based on GPU memory
+    # DINO authors: LR is most sensitive hyperparameter, scale with batch size
+    # Smaller batch sizes need proportionally smaller learning rates
+    batch_size = 128  # Adjust based on your GPU memory constraints
     train_loader = DataLoader(ssl_ds_train, batch_size=batch_size, shuffle=True,
                               num_workers=num_cores, pin_memory=True)
     knn_train_loader = DataLoader(knn_train_ds, batch_size=batch_size, shuffle=False,
@@ -563,17 +564,17 @@ if __name__ == '__main__':
     print("Using device:", device)
 
     # --- Vision Transformer student + teacher ---
-    # Scaled UP for better GPU (A100 40GB or similar)
     # With 96x96 images: patch_size=4 gives 576 patches, patch_size=8 gives 144 patches
     # Using patch_size=4 for better detail capture (more patches = finer granularity)
+    embed_dim = 512  # Can be reduced for smaller GPUs (e.g., 256, 384)
     model = VisionTransformer(
         image_size=image_size,  # 96x96 for competition
         patch_size=4,  # Smaller patches = more detail: (96/4)^2 = 576 patches
         in_channels=3,
-        embed_dim=512,  # Scaled up from 256 for better capacity
-        num_heads=8,    # embed_dim must be divisible by num_heads (512/8 = 64)
-        mlp_dim=2048,   # Scaled up from 1024 (typically 4x embed_dim)
-        num_layers=12,  # Scaled up from 6 for more depth
+        embed_dim=embed_dim,
+        num_heads=8,    # embed_dim must be divisible by num_heads
+        mlp_dim=2048,   # Typically 4x embed_dim
+        num_layers=12,  # Can be reduced for smaller GPUs
         num_classes=100,  # not used for SSL
         dropout=0.1
     ).to(device)
@@ -583,18 +584,28 @@ if __name__ == '__main__':
     teacher.eval()
 
     # --- Projection heads ---
-    # Scaled up projection head to match larger model
-    student_head = DINOHead(in_dim=512, out_dim=512).to(device)  # Scaled up from 256
-    teacher_head = DINOHead(in_dim=512, out_dim=512).to(device)  # Scaled up from 256
+    # DINO paper: use >=65k prototypes for best results
+    # Using 65536 (2^16) for optimal performance - this is critical for stability
+    projection_dim = 65536
+    student_head = DINOHead(in_dim=embed_dim, out_dim=projection_dim).to(device)
+    teacher_head = DINOHead(in_dim=embed_dim, out_dim=projection_dim).to(device)
 
     # --- Optimizer ---
-    # Learning rate: 5e-4 works well for DINO
+    # Learning rate: DINO authors say this is the most sensitive hyperparameter
+    # Scale LR with batch size: base_lr * (batch_size / 256) is common
+    # For smaller batch sizes, reduce LR proportionally to maintain stability
+    base_lr = 5e-4
+    # Use the batch_size defined above
+    lr_scale = batch_size / 256.0  # Scale relative to standard batch size
+    learning_rate = base_lr * lr_scale
+    
     optimizer = torch.optim.AdamW(
         list(student.parameters()) + list(student_head.parameters()),
-        lr=5e-4,  # Base learning rate
+        lr=learning_rate,
         weight_decay=0.04,
         betas=(0.9, 0.999)
     )
+    print(f"Using learning rate: {learning_rate:.6f} (scaled by batch_size={batch_size}/256)")
 
     total_params = sum(p.numel() for p in student.parameters())
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
