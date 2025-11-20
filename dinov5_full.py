@@ -371,9 +371,9 @@ class VisionTransformer(nn.Module):
     for block in self.transformer_blocks:
         x = block(x)
     x = self.norm(x)
-    cls_token_output = x[:, 0]
+    cls_token_output = x[:, 0]  # Extract CLS token (first token) - used for k-NN evaluation
     if return_embedding:
-        return cls_token_output
+        return cls_token_output  # Return CLS token embedding only
     logits = self.head(cls_token_output)
     return logits
 
@@ -382,14 +382,17 @@ class VisionTransformer(nn.Module):
 # ======================================================================
 
 # --- NEW --- k-NN Evaluation Function
+# DINO paper: evaluate on teacher EMA model, using [cls] token only
+# The return_embedding=True flag returns cls_token_output = x[:, 0] from VisionTransformer
 @torch.no_grad()
 def knn_evaluate(model, train_loader, test_loader, k, device):
     model.eval()
-    # 1. Build feature bank
+    # 1. Build feature bank using CLS token embeddings
+    # model(images, return_embedding=True) returns the CLS token (first token) from VisionTransformer
     features_list, labels_list = [], []
     for images, labels in train_loader:
         images = images.to(device)
-        feats = model(images, return_embedding=True)
+        feats = model(images, return_embedding=True)  # Returns CLS token embedding
         feats = F.normalize(feats, dim=1)
         features_list.append(feats.cpu())
         labels_list.append(labels)
@@ -404,7 +407,7 @@ def knn_evaluate(model, train_loader, test_loader, k, device):
     total_correct, total_samples = 0, 0
     for images, labels in test_loader:
         images, labels = images.to(device), labels.numpy()
-        feats = model(images, return_embedding=True)
+        feats = model(images, return_embedding=True)  # Returns CLS token embedding
         feats = F.normalize(feats, dim=1).cpu().numpy().astype('float32')
         D, I = index.search(feats, k)
         neighbor_labels = train_labels[I]
