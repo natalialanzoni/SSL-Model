@@ -1,7 +1,23 @@
 # DINO Self-Supervised Learning Implementation
 # Converted from Jupyter notebook
-
-# Note: Install dependencies with: pip install faiss-cpu torch torchvision datasets
+#
+# USAGE:
+#   python dinov5_full.py
+#
+# This script will automatically check and install required dependencies.
+# For manual installation, use: pip install -r requirements.txt
+#
+# REQUIREMENTS:
+#   - Python 3.8+
+#   - CUDA-capable GPU recommended (A100 40GB, V100 32GB, or similar)
+#   - ~16GB+ GPU memory for full model
+#
+# The script will:
+#   1. Check and install dependencies automatically
+#   2. Load and combine CIFAR-10 and STL-10 datasets
+#   3. Train DINO model with constant learning rate (1e-4)
+#   4. Generate training curves (loss and k-NN accuracy plots)
+#   5. Save checkpoints and best model
 
 # pip install faiss-cpu
 import torch
@@ -16,6 +32,7 @@ from datasets import load_dataset
 from torchvision import transforms
 import numpy as np
 import os # --- NEW --- Import os to get CPU count
+import matplotlib.pyplot as plt  # For plotting loss and k-NN accuracy
 
 class DINOTarget:
     def __init__(self, dim, momentum=0.9, teacher_temp=0.07, device="cuda"):
@@ -103,7 +120,8 @@ def koleo_loss(embeddings, k=3, eps=1e-8):
 
 def train_dino(train_loader, student, teacher, student_head, teacher_head,
                optimizer, device="cuda", num_epochs=50, ema_m=0.996, knn_eval_freq=5,
-               warmup_epochs=10, save_dir="./checkpoints", save_freq=10, koleo_weight=0.1):
+               warmup_epochs=10, save_dir="./checkpoints", save_freq=10, koleo_weight=0.1,
+               knn_train_loader=None, knn_test_loader=None):
 
     # Initialize teacher as a copy of student
     teacher.load_state_dict(student.state_dict())
@@ -117,26 +135,26 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
         Path(save_dir).mkdir(parents=True, exist_ok=True)
     
     best_knn_acc = 0.0
+    
+    # Track losses and k-NN accuracies for plotting
+    losses = []
+    knn_accuracies = []
+    epochs_evaluated = []
 
     scaler = torch.amp.GradScaler()
     num_batches = len(train_loader)
-    base_lr = optimizer.param_groups[0]['lr']
+    # Use constant learning rate of 1e-4 (no scheduler)
+    constant_lr = 1e-4
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = constant_lr
     
     for epoch in range(num_epochs):
         start_time = time.time()
         student.train()
         total_loss = 0
         
-        # Learning rate warmup and cosine decay
-        if epoch < warmup_epochs:
-            lr = base_lr * (epoch + 1) / warmup_epochs
-        else:
-            # Cosine decay with higher minimum LR floor (25% of base_lr) to prevent too low LR
-            # This helps the model continue learning in later epochs
-            progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
-            lr = base_lr * (0.25 + 0.75 * 0.5 * (1 + np.cos(np.pi * progress)))
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        # Use constant learning rate (no scheduler)
+        lr = constant_lr
         
         # EMA momentum scheduling (DINO paper: constant 0.996 for backbone)
         # For stability, keep EMA constant or schedule very slowly
@@ -206,6 +224,7 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
             update_teacher(student, teacher, student_head, teacher_head, current_ema_m)
 
         avg_loss = total_loss / len(train_loader)
+        losses.append(avg_loss)  # Track loss for plotting
         epoch_time = time.time() - start_time
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}, LR: {lr:.6f}, EMA: {current_ema_m:.4f}, Time: {epoch_time:.2f}s")
 
@@ -213,8 +232,11 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
         # DINO paper: evaluate on teacher EMA model only, using [cls] token
         knn_acc = None
         if (epoch + 1) % knn_eval_freq == 0 or (epoch + 1) == num_epochs:
-            knn_acc = knn_evaluate(teacher, knn_train_loader, knn_test_loader, k=20, device=device)
-            print(f"--- Epoch {epoch+1}, k-NN Accuracy (teacher): {knn_acc:.2f}% ---")
+            if knn_train_loader is not None and knn_test_loader is not None:
+                knn_acc = knn_evaluate(teacher, knn_train_loader, knn_test_loader, k=20, device=device)
+                knn_accuracies.append(knn_acc)
+                epochs_evaluated.append(epoch + 1)
+                print(f"--- Epoch {epoch+1}, k-NN Accuracy (teacher): {knn_acc:.2f}% ---")
             
             # Save best model
             if knn_acc > best_knn_acc:
@@ -248,6 +270,38 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
                 'dino_target_center': dino_target.center.cpu(),
             }
             torch.save(checkpoint, f"{save_dir}/checkpoint_epoch_{epoch+1}.pt")
+    
+    # Plot loss and k-NN accuracy
+    if len(losses) > 0:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        
+        # Plot loss
+        ax1.plot(range(1, len(losses) + 1), losses, 'b-', linewidth=2)
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.set_title('Training Loss', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlim([1, len(losses)])
+        
+        # Plot k-NN accuracy
+        if len(knn_accuracies) > 0:
+            ax2.plot(epochs_evaluated, knn_accuracies, 'r-o', linewidth=2, markersize=6)
+            ax2.set_xlabel('Epoch', fontsize=12)
+            ax2.set_ylabel('k-NN Accuracy (%)', fontsize=12)
+            ax2.set_title('k-NN Accuracy (Teacher)', fontsize=14, fontweight='bold')
+            ax2.grid(True, alpha=0.3)
+            ax2.set_xlim([1, num_epochs])
+            ax2.set_ylim([0, max(100, max(knn_accuracies) * 1.1)])
+        else:
+            ax2.text(0.5, 0.5, 'No k-NN evaluations yet', 
+                    ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+            ax2.set_title('k-NN Accuracy (Teacher)', fontsize=14, fontweight='bold')
+        
+        plt.tight_layout()
+        plot_path = f"{save_dir}/training_curves.png" if save_dir else "training_curves.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"\n✓ Saved training curves to {plot_path}")
+        plt.close()
 
 
 # ======================================================================
@@ -433,6 +487,85 @@ def knn_evaluate(model, train_loader, test_loader, k, device):
 # ======================================================================
 
 if __name__ == '__main__':
+    ################################################################################
+    ############################# DEPENDENCY INSTALLATION #########################
+    ################################################################################
+    
+    import subprocess
+    import sys
+    
+    def install_package(package):
+        """Install a package using pip if not already installed"""
+        try:
+            __import__(package)
+        except ImportError:
+            print(f"Installing {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            print(f"✓ {package} installed successfully")
+    
+    print("=" * 70)
+    print("CHECKING AND INSTALLING DEPENDENCIES")
+    print("=" * 70)
+    
+    # Core dependencies
+    required_packages = {
+        'torch': 'torch',
+        'torchvision': 'torchvision',
+        'numpy': 'numpy',
+        'PIL': 'Pillow',
+        'matplotlib': 'matplotlib',
+        'faiss': 'faiss-cpu',  # Use faiss-gpu if you have CUDA and want GPU acceleration
+        'datasets': 'datasets',  # HuggingFace datasets (for load_dataset if needed)
+    }
+    
+    # Try to import, install if missing
+    for module_name, package_name in required_packages.items():
+        try:
+            if module_name == 'PIL':
+                import PIL
+            elif module_name == 'faiss':
+                import faiss
+            elif module_name == 'datasets':
+                from datasets import load_dataset  # Test HuggingFace datasets import
+            else:
+                __import__(module_name)
+            print(f"✓ {package_name} already installed")
+        except ImportError:
+            print(f"Installing {package_name}...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", package_name], 
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"✓ {package_name} installed successfully")
+            except subprocess.CalledProcessError:
+                print(f"✗ Failed to install {package_name}. Please install manually: pip install {package_name}")
+                sys.exit(1)
+    
+    # Optional: Check for GPU and suggest faiss-gpu if available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            print(f"\n✓ CUDA is available! GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  CUDA Version: {torch.version.cuda}")
+            try:
+                import faiss
+                # Check if faiss has GPU support
+                if not hasattr(faiss, 'StandardGpuResources'):
+                    print("\n  Note: For better k-NN performance, consider installing faiss-gpu:")
+                    print("    pip uninstall faiss-cpu")
+                    print("    pip install faiss-gpu")
+            except:
+                pass
+        else:
+            print("\n⚠ CUDA not available. Training will use CPU (much slower).")
+            print("  For GPU training, ensure CUDA and PyTorch with CUDA support are installed.")
+    except:
+        pass
+    
+    print("=" * 70)
+    print("ALL DEPENDENCIES CHECKED - READY TO RUN")
+    print("=" * 70)
+    print()
+    
     # Additional imports needed for main execution
     from torchvision.transforms import InterpolationMode
     from torchvision.datasets import STL10, CIFAR10
@@ -442,73 +575,99 @@ if __name__ == '__main__':
     ############################# DATASET SETUP ####################################
     ################################################################################
 
-    # Dataset selection: STL-10 (96x96 native) or CIFAR-10 (32x32, will be resized)
-    USE_STL10 = True  # Set to False to use CIFAR-10 (resized to 96x96)
+    # Use both CIFAR-10 and STL-10 datasets combined
     image_size = 96  # Competition requirement: 96x96 images
     
-    if USE_STL10:
-        # STL-10 is 96x96 native - perfect for competition!
-        # Using torchvision's STL10 dataset
-        print("Loading STL-10 dataset (96x96 native)...")
-        # STL10 needs a root directory - using a temp path
-        # For Colab, you can use '/tmp/stl10' or download to a persistent location
-        stl10_root = '/tmp/stl10'
-        train_ds = STL10(root=stl10_root, split='train', download=True, transform=None)
-        test_ds = STL10(root=stl10_root, split='test', download=True, transform=None)
-        resize_input = False  # Already 96x96, no need to resize
-    else:
-        # CIFAR-10 is 32x32, will be resized to 96x96 (introduces artifacts)
-        print("Loading CIFAR-10 dataset (will resize 32x32 -> 96x96)...")
-        cifar10_root = '/tmp/cifar10'
-        train_ds = CIFAR10(root=cifar10_root, train=True, download=True, transform=None)
-        test_ds = CIFAR10(root=cifar10_root, train=False, download=True, transform=None)
-        resize_input = True  # Need to resize from 32x32 to 96x96
+    print("Loading CIFAR-10 dataset (will resize 32x32 -> 96x96)...")
+    cifar10_root = '/tmp/cifar10'
+    cifar10_train = CIFAR10(root=cifar10_root, train=True, download=True, transform=None)
+    cifar10_test = CIFAR10(root=cifar10_root, train=False, download=True, transform=None)
+    
+    print("Loading STL-10 dataset (96x96 native)...")
+    stl10_root = '/tmp/stl10'
+    stl10_train = STL10(root=stl10_root, split='train', download=True, transform=None)
+    stl10_test = STL10(root=stl10_root, split='test', download=True, transform=None)
+    
+    # Combine datasets using ConcatDataset
+    from torch.utils.data import ConcatDataset
+    train_ds = ConcatDataset([cifar10_train, stl10_train])
+    test_ds = ConcatDataset([cifar10_test, stl10_test])
+    
+    print(f"Combined dataset: CIFAR-10 ({len(cifar10_train)} train, {len(cifar10_test)} test) + "
+          f"STL-10 ({len(stl10_train)} train, {len(stl10_test)} test)")
+    print(f"Total: {len(train_ds)} train, {len(test_ds)} test samples")
+    
+    # CIFAR-10 needs resizing, STL-10 doesn't - we'll handle this in DINODataset
+    resize_input = True  # Will resize CIFAR-10, but STL-10 is already 96x96
 
     # ----------------------------
     # DINO-style SSL dataset
     # ----------------------------
     class DINODataset(torch.utils.data.Dataset):
-        def __init__(self, torchvision_dataset, image_size=96, num_local_crops=4, resize_input=True):
+        def __init__(self, torchvision_dataset, image_size=96, num_local_crops=4, 
+                     cifar10_size=None, stl10_size=None):
+            """
+            Args:
+                torchvision_dataset: Can be a single dataset or ConcatDataset
+                cifar10_size: Size of CIFAR-10 dataset (if combined with STL-10)
+                stl10_size: Size of STL-10 dataset (if combined with CIFAR-10)
+            """
             self.dataset = torchvision_dataset
             self.num_local_crops = num_local_crops
-            self.resize_input = resize_input  # Set to False if images are already 96x96 or larger
-
-            # Global crop transforms (DINOv2-style stronger augmentations)
-            # Global crops should be >50% of original image (0.5-1.0 scale)
-            global_transforms = []
-            if resize_input:
-                # Resize CIFAR-10 (32x32) to 96x96 before cropping
-                # Using bicubic interpolation for better quality
-                global_transforms.append(transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC))
-            global_transforms.extend([
-                transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),  # Changed from (0.32, 1.0) to ensure >50%
+            self.cifar10_size = cifar10_size  # CIFAR-10 needs resizing
+            self.stl10_size = stl10_size  # STL-10 is already 96x96
+            
+            # Transforms for CIFAR-10 (needs resizing from 32x32 to 96x96)
+            global_transforms_cifar = [
+                transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+                transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
                 transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),  # DINOv2: Stronger color jitter (0.8 vs 0.4)
+                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
                 transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),  # Larger kernel
-                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),  # DINOv2: Solarization
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
+                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-            self.global_transform = transforms.Compose(global_transforms)
-
-            # Local crop transforms (DINOv2-style stronger augmentations)
-            # Local crops: 14-50% of original image (more reasonable than 5% for 96x96)
-            local_transforms = []
-            if resize_input:
-                # Resize CIFAR-10 (32x32) to 96x96 before cropping
-                local_transforms.append(transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC))
-            local_transforms.extend([
-                transforms.RandomResizedCrop(image_size, scale=(0.14, 0.5)),  # Changed from (0.05, 0.32) - 14% min is more reasonable
+            ]
+            self.global_transform_cifar = transforms.Compose(global_transforms_cifar)
+            
+            local_transforms_cifar = [
+                transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+                transforms.RandomResizedCrop(image_size, scale=(0.14, 0.5)),
                 transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),  # DINOv2: Stronger color jitter (0.8 vs 0.4)
+                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
                 transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),  # Larger kernel
-                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),  # DINOv2: Solarization
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
+                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-            self.local_transform = transforms.Compose(local_transforms)
+            ]
+            self.local_transform_cifar = transforms.Compose(local_transforms_cifar)
+            
+            # Transforms for STL-10 (already 96x96, no resizing needed)
+            global_transforms_stl = [
+                transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
+                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ]
+            self.global_transform_stl = transforms.Compose(global_transforms_stl)
+            
+            local_transforms_stl = [
+                transforms.RandomResizedCrop(image_size, scale=(0.14, 0.5)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
+                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ]
+            self.local_transform_stl = transforms.Compose(local_transforms_stl)
 
         def __len__(self):
             return len(self.dataset)
@@ -516,34 +675,48 @@ if __name__ == '__main__':
         def __getitem__(self, idx):
             # torchvision datasets return (image, label) tuples
             img, _ = self.dataset[idx]  # We don't need the label for SSL
-            global_crop = self.global_transform(img)
-            local_crops = [self.local_transform(img) for _ in range(self.num_local_crops)]
+            
+            # Determine if this is from CIFAR-10 (needs resize) or STL-10 (already 96x96)
+            if self.cifar10_size is not None and idx < self.cifar10_size:
+                # CIFAR-10 sample - use transforms with resizing
+                global_crop = self.global_transform_cifar(img)
+                local_crops = [self.local_transform_cifar(img) for _ in range(self.num_local_crops)]
+            else:
+                # STL-10 sample - use transforms without resizing
+                global_crop = self.global_transform_stl(img)
+                local_crops = [self.local_transform_stl(img) for _ in range(self.num_local_crops)]
+            
             return global_crop, local_crops
 
-    ssl_ds_train = DINODataset(train_ds, image_size=image_size, num_local_crops=4, resize_input=resize_input)
+    ssl_ds_train = DINODataset(train_ds, image_size=image_size, num_local_crops=4,
+                               cifar10_size=len(cifar10_train), stl10_size=len(stl10_train))
 
     # ----------------------------
     # Evaluation datasets (k-NN)
     # ----------------------------
-    eval_transform_list = []
-    if resize_input:
-        # Need to resize CIFAR-10 from 32x32 to 96x96
-        eval_transform_list.append(transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC))
-    eval_transform_list.extend([
+    # CIFAR-10 needs resizing, STL-10 doesn't
+    eval_transform_cifar = transforms.Compose([
+        transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
         transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    eval_transform = transforms.Compose(eval_transform_list)
+    
+    eval_transform_stl = transforms.Compose([
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
     # For evaluation, we need to recreate the datasets with the eval transform
-    # torchvision datasets apply transforms at dataset creation, so we recreate them
-    if USE_STL10:
-        knn_train_ds = STL10(root=stl10_root, split='train', download=False, transform=eval_transform)
-        knn_test_ds = STL10(root=stl10_root, split='test', download=False, transform=eval_transform)
-    else:
-        knn_train_ds = CIFAR10(root=cifar10_root, train=True, download=False, transform=eval_transform)
-        knn_test_ds = CIFAR10(root=cifar10_root, train=False, download=False, transform=eval_transform)
+    # Combine both CIFAR-10 and STL-10 for k-NN evaluation
+    knn_cifar10_train = CIFAR10(root=cifar10_root, train=True, download=False, transform=eval_transform_cifar)
+    knn_cifar10_test = CIFAR10(root=cifar10_root, train=False, download=False, transform=eval_transform_cifar)
+    knn_stl10_train = STL10(root=stl10_root, split='train', download=False, transform=eval_transform_stl)
+    knn_stl10_test = STL10(root=stl10_root, split='test', download=False, transform=eval_transform_stl)
+    
+    knn_train_ds = ConcatDataset([knn_cifar10_train, knn_stl10_train])
+    knn_test_ds = ConcatDataset([knn_cifar10_test, knn_stl10_test])
 
     # ----------------------------
     # DataLoaders
@@ -561,7 +734,7 @@ if __name__ == '__main__':
     knn_test_loader = DataLoader(knn_test_ds, batch_size=batch_size, shuffle=False,
                                  num_workers=num_cores, pin_memory=True)
 
-    dataset_name = "STL-10" if USE_STL10 else "CIFAR-10"
+    dataset_name = "CIFAR-10 + STL-10 (Combined)"
     print(f"{dataset_name} loaded. SSL Train: {len(ssl_ds_train)}, k-NN Train: {len(knn_train_ds)}, k-NN Test: {len(knn_test_ds)}")
 
     ################################################################################
@@ -600,13 +773,8 @@ if __name__ == '__main__':
     teacher_head = DINOHead(in_dim=embed_dim, out_dim=projection_dim).to(device)
 
     # --- Optimizer ---
-    # Learning rate: DINO authors say this is the most sensitive hyperparameter
-    # Scale LR with batch size: base_lr * (batch_size / 256) is common
-    # For smaller batch sizes, reduce LR proportionally to maintain stability
-    base_lr = 5e-4
-    # Use the batch_size defined above
-    lr_scale = batch_size / 256.0  # Scale relative to standard batch size
-    learning_rate = base_lr * lr_scale
+    # Use constant learning rate of 1e-4 (no scheduler, no batch size scaling)
+    learning_rate = 1e-4
     
     optimizer = torch.optim.AdamW(
         list(student.parameters()) + list(student_head.parameters()),
@@ -614,7 +782,7 @@ if __name__ == '__main__':
         weight_decay=0.04,
         betas=(0.9, 0.999)
     )
-    print(f"Using learning rate: {learning_rate:.6f} (scaled by batch_size={batch_size}/256)")
+    print(f"Using constant learning rate: {learning_rate:.6f}")
 
     total_params = sum(p.numel() for p in student.parameters())
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
@@ -637,13 +805,15 @@ if __name__ == '__main__':
         teacher_head,
         optimizer,
         device=device,
-        num_epochs=200,  # DINO paper uses 300, but CIFAR-10 is smaller
+        num_epochs=200,  # DINO paper uses 300, but smaller datasets need fewer epochs
         ema_m=0.996,
         knn_eval_freq=20,
-        warmup_epochs=10,  # DINO uses 10 epochs warmup
+        warmup_epochs=10,  # Not used anymore (constant LR), but kept for compatibility
         save_dir="./checkpoints",  # Save checkpoints here
         save_freq=10,  # Save checkpoint every 10 epochs
-        koleo_weight=0.1  # DINOv2: KoLeo regularization weight (0.1 is a good default)
+        koleo_weight=0.1,  # DINOv2: KoLeo regularization weight (0.1 is a good default)
+        knn_train_loader=knn_train_loader,  # Pass k-NN loaders for evaluation
+        knn_test_loader=knn_test_loader
     )
 
     print("End Time:" + time.strftime("%H:%M:%S", time.localtime()))

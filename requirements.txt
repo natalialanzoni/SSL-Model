@@ -1,0 +1,28 @@
+# DINO Self-Supervised Learning - Requirements
+# Install with: pip install -r requirements.txt
+
+# Core deep learning framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data handling
+numpy>=1.25.0
+Pillow>=9.0.0
+
+# FAISS for efficient k-NN search
+# For CPU: faiss-cpu
+faiss-cpu>=1.7.0
+# For GPU (optional, better performance): faiss-gpu>=1.7.0
+# Note: Uninstall faiss-cpu before installing faiss-gpu
+
+# Plotting
+matplotlib>=3.7.0
+
+# HuggingFace datasets (for load_dataset if needed)
+datasets>=2.0.0
+
+# Note: For GPU support, ensure you have:
+# - CUDA 11.8 or 12.1 installed
+# - PyTorch with CUDA support (install from pytorch.org)
+# - faiss-gpu instead of faiss-cpu (optional but recommended)
+
