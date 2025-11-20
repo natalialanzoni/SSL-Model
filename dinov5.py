@@ -329,39 +329,6 @@ class DINOSystem(nn.Module):
         self.student_head = DINOHead(embed_dim, out_dim)
         self.teacher_head = DINOHead(embed_dim, out_dim)
 
-
-# ======================================================================
-# Cell 4
-# ======================================================================
-
-    def __init__(self, vit_student, vit_teacher, embed_dim, out_dim=65536):
-        super().__init__()
-
-        self.student = vit_student
-        self.teacher = vit_teacher
-
-        # teacher not trained directly
-        for p in self.teacher.parameters():
-            p.requires_grad = False
-
-        # projection heads
-        self.student_head = DINOHead(embed_dim, out_dim)
-        self.teacher_head = DINOHead(embed_dim, out_dim)
-
-
-def update_teacher(student, teacher, student_head, teacher_head, m=0.996):
-    # Update backbone parameters
-    for ps, pt in zip(student.parameters(), teacher.parameters()):
-        pt.data = m * pt.data + (1 - m) * ps.data
-    # Update projection head parameters
-    for ps, pt in zip(student_head.parameters(), teacher_head.parameters()):
-        pt.data = m * pt.data + (1 - m) * ps.data
-
-def dino_loss(student_logits, teacher_probs, student_temp=0.1):
-    student_log_probs = torch.log_softmax(student_logits / student_temp, dim=-1)
-    loss = -(teacher_probs * student_log_probs).sum(dim=-1).mean()
-    return loss
-
 # ======================================================================
 # Cell 5
 # ======================================================================
@@ -456,16 +423,10 @@ def knn_evaluate(model, train_loader, test_loader, k, device):
 # ======================================================================
 
 if __name__ == '__main__':
-    import os
-    import time
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader
-    from torchvision import transforms
+    # Additional imports needed for main execution
     from torchvision.transforms import InterpolationMode
     from torchvision.datasets import STL10, CIFAR10
     import copy
-    import torch.nn.functional as F
 
     ################################################################################
     ############################# DATASET SETUP ####################################
