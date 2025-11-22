@@ -53,7 +53,7 @@ class DINOTarget:
 
 def load_checkpoint(checkpoint_path, student, teacher, student_head, teacher_head, optimizer=None, device="cuda"):
     """Load a checkpoint and restore model states"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     student.load_state_dict(checkpoint['student_state_dict'])
     teacher.load_state_dict(checkpoint['teacher_state_dict'])
     student_head.load_state_dict(checkpoint['student_head_state_dict'])
@@ -121,34 +121,75 @@ def koleo_loss(embeddings, k=3, eps=1e-8):
 def train_dino(train_loader, student, teacher, student_head, teacher_head,
                optimizer, device="cuda", num_epochs=50, ema_m=0.996, knn_eval_freq=5,
                warmup_epochs=10, save_dir="./checkpoints", save_freq=10, koleo_weight=0.1,
-               knn_train_loader=None, knn_test_loader=None):
+               knn_train_loader=None, knn_test_loader=None, resume_from=None):
 
-    # Initialize teacher as a copy of student
-    teacher.load_state_dict(student.state_dict())
-    teacher.eval()
-    # Initialize teacher_head as a copy of student_head
-    teacher_head.load_state_dict(student_head.state_dict())
-    dino_target = DINOTarget(dim=teacher_head.mlp[-1].out_features, device=device)
-    
     # Create checkpoint directory
     if save_dir:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
     
+    # Initialize or resume from checkpoint
+    start_epoch = 0
     best_knn_acc = 0.0
-    
-    # Track losses and k-NN accuracies for plotting
     losses = []
     knn_accuracies = []
     epochs_evaluated = []
-
     scaler = torch.amp.GradScaler()
+    
+    # Check for resume checkpoint
+    resume_checkpoint_path = None
+    if resume_from:
+        resume_checkpoint_path = resume_from
+    elif save_dir:
+        # Check for latest checkpoint
+        latest_checkpoint = Path(save_dir) / "checkpoint_latest.pt"
+        if latest_checkpoint.exists():
+            resume_checkpoint_path = str(latest_checkpoint)
+    
+    if resume_checkpoint_path and Path(resume_checkpoint_path).exists():
+        print(f"\n🔄 Resuming training from {resume_checkpoint_path}...")
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device, weights_only=False)
+        student.load_state_dict(checkpoint['student_state_dict'])
+        teacher.load_state_dict(checkpoint['teacher_state_dict'])
+        student_head.load_state_dict(checkpoint['student_head_state_dict'])
+        teacher_head.load_state_dict(checkpoint['teacher_head_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch']
+        best_knn_acc = checkpoint.get('best_knn_acc', 0.0)
+        losses = checkpoint.get('losses', [])
+        knn_accuracies = checkpoint.get('knn_accuracies', [])
+        epochs_evaluated = checkpoint.get('epochs_evaluated', [])
+        print(f"✓ Resumed from epoch {start_epoch}, best k-NN acc: {best_knn_acc:.2f}%")
+    else:
+        # Initialize teacher as a copy of student
+        teacher.load_state_dict(student.state_dict())
+        teacher.eval()
+        # Initialize teacher_head as a copy of student_head
+        teacher_head.load_state_dict(student_head.state_dict())
+        print("✓ Starting fresh training")
+    
+    dino_target = DINOTarget(dim=teacher_head.mlp[-1].out_features, device=device)
+    if resume_checkpoint_path and Path(resume_checkpoint_path).exists():
+        # Restore DINO target center if available
+        if 'dino_target_center' in checkpoint:
+            dino_target.center = checkpoint['dino_target_center'].to(device)
+    
     num_batches = len(train_loader)
     # Use constant learning rate of 1e-4 (no scheduler)
     constant_lr = 1e-4
     for param_group in optimizer.param_groups:
         param_group['lr'] = constant_lr
     
-    for epoch in range(num_epochs):
+    # Initialize plot for real-time updates
+    fig, ax1, ax2 = None, None, None
+    plot_path = None
+    if save_dir:
+        plot_path = f"{save_dir}/training_curves.png"
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        plt.ion()  # Turn on interactive mode
+    
+    for epoch in range(start_epoch, num_epochs):
         start_time = time.time()
         student.train()
         total_loss = 0
@@ -227,6 +268,36 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
         losses.append(avg_loss)  # Track loss for plotting
         epoch_time = time.time() - start_time
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}, LR: {lr:.6f}, EMA: {current_ema_m:.4f}, Time: {epoch_time:.2f}s")
+        
+        # Update plot in real-time
+        if save_dir and len(losses) > 0 and fig is not None:
+            ax1.clear()
+            ax1.plot(range(1, len(losses) + 1), losses, 'b-', linewidth=2)
+            ax1.set_xlabel('Epoch', fontsize=12)
+            ax1.set_ylabel('Loss', fontsize=12)
+            ax1.set_title('Training Loss', fontsize=14, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xlim([1, max(len(losses), num_epochs)])
+            
+            if len(knn_accuracies) > 0:
+                ax2.clear()
+                ax2.plot(epochs_evaluated, knn_accuracies, 'r-o', linewidth=2, markersize=6)
+                ax2.set_xlabel('Epoch', fontsize=12)
+                ax2.set_ylabel('k-NN Accuracy (%)', fontsize=12)
+                ax2.set_title('k-NN Accuracy (Teacher)', fontsize=14, fontweight='bold')
+                ax2.grid(True, alpha=0.3)
+                ax2.set_xlim([1, num_epochs])
+                if len(knn_accuracies) > 0:
+                    ax2.set_ylim([0, max(100, max(knn_accuracies) * 1.1)])
+            else:
+                ax2.clear()
+                ax2.text(0.5, 0.5, 'No k-NN evaluations yet', 
+                        ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+                ax2.set_title('k-NN Accuracy (Teacher)', fontsize=14, fontweight='bold')
+            
+            plt.tight_layout()
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.pause(0.01)  # Small pause to update display
 
         # k-NN evaluation and checkpoint saving
         # DINO paper: evaluate on teacher EMA model only, using [cls] token
@@ -249,14 +320,39 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
                         'student_head_state_dict': student_head.state_dict(),
                         'teacher_head_state_dict': teacher_head.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
                         'knn_acc': knn_acc,
                         'loss': avg_loss,
+                        'best_knn_acc': best_knn_acc,
                         'dino_target_center': dino_target.center.cpu(),
+                        'losses': losses,
+                        'knn_accuracies': knn_accuracies,
+                        'epochs_evaluated': epochs_evaluated,
                     }
-                    torch.save(checkpoint, f"{save_dir}/best_model.pt")
+                    torch.save(checkpoint, f"{save_dir}/best_model.pt", _use_new_zipfile_serialization=False)
                     print(f"  → Saved best model (k-NN: {knn_acc:.2f}%)")
         
-        # Periodic checkpoint saving
+        # Save latest checkpoint every epoch (for resuming)
+        if save_dir:
+            latest_checkpoint = {
+                'epoch': epoch + 1,
+                'student_state_dict': student.state_dict(),
+                'teacher_state_dict': teacher.state_dict(),
+                'student_head_state_dict': student_head.state_dict(),
+                'teacher_head_state_dict': teacher_head.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'knn_acc': knn_acc,
+                'loss': avg_loss,
+                'best_knn_acc': best_knn_acc,
+                'dino_target_center': dino_target.center.cpu(),
+                'losses': losses,
+                'knn_accuracies': knn_accuracies,
+                'epochs_evaluated': epochs_evaluated,
+            }
+            torch.save(latest_checkpoint, f"{save_dir}/checkpoint_latest.pt", _use_new_zipfile_serialization=False)
+        
+        # Periodic checkpoint saving (numbered checkpoints)
         if save_dir and (epoch + 1) % save_freq == 0:
             checkpoint = {
                 'epoch': epoch + 1,
@@ -265,42 +361,24 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
                 'student_head_state_dict': student_head.state_dict(),
                 'teacher_head_state_dict': teacher_head.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
                 'knn_acc': knn_acc,
                 'loss': avg_loss,
+                'best_knn_acc': best_knn_acc,
                 'dino_target_center': dino_target.center.cpu(),
+                'losses': losses,
+                'knn_accuracies': knn_accuracies,
+                'epochs_evaluated': epochs_evaluated,
             }
-            torch.save(checkpoint, f"{save_dir}/checkpoint_epoch_{epoch+1}.pt")
+            torch.save(checkpoint, f"{save_dir}/checkpoint_epoch_{epoch+1}.pt", _use_new_zipfile_serialization=False)
+            print(f"  → Saved checkpoint: checkpoint_epoch_{epoch+1}.pt")
     
-    # Plot loss and k-NN accuracy
-    if len(losses) > 0:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-        
-        # Plot loss
-        ax1.plot(range(1, len(losses) + 1), losses, 'b-', linewidth=2)
-        ax1.set_xlabel('Epoch', fontsize=12)
-        ax1.set_ylabel('Loss', fontsize=12)
-        ax1.set_title('Training Loss', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
-        ax1.set_xlim([1, len(losses)])
-        
-        # Plot k-NN accuracy
-        if len(knn_accuracies) > 0:
-            ax2.plot(epochs_evaluated, knn_accuracies, 'r-o', linewidth=2, markersize=6)
-            ax2.set_xlabel('Epoch', fontsize=12)
-            ax2.set_ylabel('k-NN Accuracy (%)', fontsize=12)
-            ax2.set_title('k-NN Accuracy (Teacher)', fontsize=14, fontweight='bold')
-            ax2.grid(True, alpha=0.3)
-            ax2.set_xlim([1, num_epochs])
-            ax2.set_ylim([0, max(100, max(knn_accuracies) * 1.1)])
-        else:
-            ax2.text(0.5, 0.5, 'No k-NN evaluations yet', 
-                    ha='center', va='center', transform=ax2.transAxes, fontsize=12)
-            ax2.set_title('k-NN Accuracy (Teacher)', fontsize=14, fontweight='bold')
-        
+    # Final plot update
+    if save_dir and len(losses) > 0 and fig is not None:
+        plt.ioff()  # Turn off interactive mode
         plt.tight_layout()
-        plot_path = f"{save_dir}/training_curves.png" if save_dir else "training_curves.png"
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        print(f"\n✓ Saved training curves to {plot_path}")
+        print(f"\n✓ Final training curves saved to {plot_path}")
         plt.close()
 
 
@@ -575,51 +653,51 @@ if __name__ == '__main__':
     ############################# DATASET SETUP ####################################
     ################################################################################
 
-    # Use both CIFAR-10 and STL-10 datasets combined
+    # Load competition pretraining dataset from HuggingFace
     image_size = 96  # Competition requirement: 96x96 images
     
-    print("Loading CIFAR-10 dataset (will resize 32x32 -> 96x96)...")
+    print("Loading competition pretraining dataset from HuggingFace...")
+    print("Dataset: tsbpp/fall2025_deeplearning (pretrain split)")
+    
+    # Load the pretraining dataset (unlabeled)
+    pretrain_dataset = load_dataset("tsbpp/fall2025_deeplearning", "pretrain", split="train")
+    
+    print(f"Loaded {len(pretrain_dataset)} unlabeled images for pretraining")
+    print(f"Dataset features: {pretrain_dataset.features}")
+    
+    # For evaluation, we still need CIFAR-10/STL-10 for k-NN evaluation during training
+    # (or you can skip k-NN evaluation during training and only evaluate on CUB-200)
+    print("\nLoading CIFAR-10 + STL-10 for k-NN evaluation during training...")
     cifar10_root = '/tmp/cifar10'
     cifar10_train = CIFAR10(root=cifar10_root, train=True, download=True, transform=None)
     cifar10_test = CIFAR10(root=cifar10_root, train=False, download=True, transform=None)
     
-    print("Loading STL-10 dataset (96x96 native)...")
     stl10_root = '/tmp/stl10'
     stl10_train = STL10(root=stl10_root, split='train', download=True, transform=None)
     stl10_test = STL10(root=stl10_root, split='test', download=True, transform=None)
     
-    # Combine datasets using ConcatDataset
     from torch.utils.data import ConcatDataset
-    train_ds = ConcatDataset([cifar10_train, stl10_train])
-    test_ds = ConcatDataset([cifar10_test, stl10_test])
+    knn_train_ds = ConcatDataset([cifar10_train, stl10_train])
+    knn_test_ds = ConcatDataset([cifar10_test, stl10_test])
     
-    print(f"Combined dataset: CIFAR-10 ({len(cifar10_train)} train, {len(cifar10_test)} test) + "
-          f"STL-10 ({len(stl10_train)} train, {len(stl10_test)} test)")
-    print(f"Total: {len(train_ds)} train, {len(test_ds)} test samples")
-    
-    # CIFAR-10 needs resizing, STL-10 doesn't - we'll handle this in DINODataset
-    resize_input = True  # Will resize CIFAR-10, but STL-10 is already 96x96
+    print(f"k-NN evaluation dataset: {len(knn_train_ds)} train, {len(knn_test_ds)} test samples")
 
     # ----------------------------
     # DINO-style SSL dataset
     # ----------------------------
     class DINODataset(torch.utils.data.Dataset):
-        def __init__(self, torchvision_dataset, image_size=96, num_local_crops=4, 
-                     cifar10_size=None, stl10_size=None):
+        def __init__(self, hf_dataset, image_size=96, num_local_crops=4):
             """
             Args:
-                torchvision_dataset: Can be a single dataset or ConcatDataset
-                cifar10_size: Size of CIFAR-10 dataset (if combined with STL-10)
-                stl10_size: Size of STL-10 dataset (if combined with CIFAR-10)
+                hf_dataset: HuggingFace dataset (returns dict with 'image' key)
+                image_size: Target image size
+                num_local_crops: Number of local crops per image
             """
-            self.dataset = torchvision_dataset
+            self.dataset = hf_dataset
             self.num_local_crops = num_local_crops
-            self.cifar10_size = cifar10_size  # CIFAR-10 needs resizing
-            self.stl10_size = stl10_size  # STL-10 is already 96x96
             
-            # Transforms for CIFAR-10 (needs resizing from 32x32 to 96x96)
-            global_transforms_cifar = [
-                transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+            # Global crop transforms (DINO-style augmentations)
+            global_transforms = [
                 transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
@@ -629,10 +707,10 @@ if __name__ == '__main__':
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ]
-            self.global_transform_cifar = transforms.Compose(global_transforms_cifar)
+            self.global_transform = transforms.Compose(global_transforms)
             
-            local_transforms_cifar = [
-                transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+            # Local crop transforms
+            local_transforms = [
                 transforms.RandomResizedCrop(image_size, scale=(0.14, 0.5)),
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
@@ -642,54 +720,32 @@ if __name__ == '__main__':
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ]
-            self.local_transform_cifar = transforms.Compose(local_transforms_cifar)
-            
-            # Transforms for STL-10 (already 96x96, no resizing needed)
-            global_transforms_stl = [
-                transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
-                transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
-                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ]
-            self.global_transform_stl = transforms.Compose(global_transforms_stl)
-            
-            local_transforms_stl = [
-                transforms.RandomResizedCrop(image_size, scale=(0.14, 0.5)),
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
-                transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
-                transforms.RandomApply([transforms.RandomSolarize(threshold=128, p=1.0)], p=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ]
-            self.local_transform_stl = transforms.Compose(local_transforms_stl)
+            self.local_transform = transforms.Compose(local_transforms)
 
         def __len__(self):
             return len(self.dataset)
 
         def __getitem__(self, idx):
-            # torchvision datasets return (image, label) tuples
-            img, _ = self.dataset[idx]  # We don't need the label for SSL
+            # HuggingFace dataset returns dict with 'image' key (PIL Image)
+            item = self.dataset[idx]
+            img = item['image']
             
-            # Determine if this is from CIFAR-10 (needs resize) or STL-10 (already 96x96)
-            if self.cifar10_size is not None and idx < self.cifar10_size:
-                # CIFAR-10 sample - use transforms with resizing
-                global_crop = self.global_transform_cifar(img)
-                local_crops = [self.local_transform_cifar(img) for _ in range(self.num_local_crops)]
-            else:
-                # STL-10 sample - use transforms without resizing
-                global_crop = self.global_transform_stl(img)
-                local_crops = [self.local_transform_stl(img) for _ in range(self.num_local_crops)]
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Resize to ensure minimum size for cropping
+            if min(img.size) < image_size:
+                img = transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC)(img)
+            
+            # Apply transforms
+            global_crop = self.global_transform(img)
+            local_crops = [self.local_transform(img) for _ in range(self.num_local_crops)]
             
             return global_crop, local_crops
 
-    ssl_ds_train = DINODataset(train_ds, image_size=image_size, num_local_crops=4,
-                               cifar10_size=len(cifar10_train), stl10_size=len(stl10_train))
+    # Create SSL dataset from HuggingFace pretraining data
+    ssl_ds_train = DINODataset(pretrain_dataset, image_size=image_size, num_local_crops=4)
 
     # ----------------------------
     # Evaluation datasets (k-NN)
@@ -734,7 +790,7 @@ if __name__ == '__main__':
     knn_test_loader = DataLoader(knn_test_ds, batch_size=batch_size, shuffle=False,
                                  num_workers=num_cores, pin_memory=True)
 
-    dataset_name = "CIFAR-10 + STL-10 (Combined)"
+    dataset_name = "Competition Pretraining Dataset (HuggingFace)"
     print(f"{dataset_name} loaded. SSL Train: {len(ssl_ds_train)}, k-NN Train: {len(knn_train_ds)}, k-NN Test: {len(knn_test_ds)}")
 
     ################################################################################
@@ -797,6 +853,10 @@ if __name__ == '__main__':
 
     # DINO paper trains for 300 epochs on ImageNet
     # For CIFAR-10, we'll use 200 epochs (smaller dataset needs fewer epochs)
+    # Optional: Resume from a specific checkpoint
+    # Set resume_from=None to start fresh, or provide path like "./checkpoints/checkpoint_latest.pt"
+    resume_from = None  # Change to checkpoint path if you want to resume from a specific checkpoint
+    
     train_dino(
         train_loader,
         student,
@@ -813,7 +873,8 @@ if __name__ == '__main__':
         save_freq=10,  # Save checkpoint every 10 epochs
         koleo_weight=0.1,  # DINOv2: KoLeo regularization weight (0.1 is a good default)
         knn_train_loader=knn_train_loader,  # Pass k-NN loaders for evaluation
-        knn_test_loader=knn_test_loader
+        knn_test_loader=knn_test_loader,
+        resume_from=resume_from  # Resume from checkpoint if interrupted
     )
 
     print("End Time:" + time.strftime("%H:%M:%S", time.localtime()))
