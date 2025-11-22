@@ -292,12 +292,12 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
                 knn_accuracies.append(knn_acc)
                 epochs_evaluated.append(epoch + 1)
                 print(f"--- Epoch {epoch+1}, k-NN Accuracy (teacher): {knn_acc:.2f}% ---")
-            
-            # Save best model
-            if knn_acc > best_knn_acc:
-                best_knn_acc = knn_acc
-                if save_dir:
-                    checkpoint = {
+                
+                # Save best model based on k-NN accuracy
+                if knn_acc > best_knn_acc:
+                    best_knn_acc = knn_acc
+                    if save_dir:
+                        checkpoint = {
                         'epoch': epoch + 1,
                         'student_state_dict': student.state_dict(),
                         'teacher_state_dict': teacher.state_dict(),
@@ -313,8 +313,8 @@ def train_dino(train_loader, student, teacher, student_head, teacher_head,
                         'knn_accuracies': knn_accuracies,
                         'epochs_evaluated': epochs_evaluated,
                     }
-                    torch.save(checkpoint, f"{save_dir}/best_model.pt", _use_new_zipfile_serialization=False)
-                    print(f"  → Saved best model (k-NN: {knn_acc:.2f}%)")
+                        torch.save(checkpoint, f"{save_dir}/best_model.pt", _use_new_zipfile_serialization=False)
+                        print(f"  → Saved best model (k-NN: {knn_acc:.2f}%)")
         
         # Save latest checkpoint every epoch (for resuming)
         if save_dir:
@@ -560,37 +560,67 @@ if __name__ == '__main__':
     # Load competition pretraining dataset from HuggingFace
     image_size = 96  # Competition requirement: 96x96 images
     
+    # OPTIMIZATION: Use subset for faster iteration during development
+    # Set to None to use full dataset, or specify number (e.g., 50000 for 50k images)
+    # Full dataset: ~500k images = 2-5 hours/epoch with batch_size=32
+    # 50k subset: ~20-30 min/epoch (good for testing hyperparameters)
+    DATASET_SUBSET_SIZE = None  # None = full dataset, or set to e.g., 50000, 100000
+    
     print("Loading competition pretraining dataset from HuggingFace...")
     print("Dataset: tsbpp/fall2025_deeplearning (pretrain split)")
     
     # Load the pretraining dataset (unlabeled)
-    pretrain_dataset = load_dataset("tsbpp/fall2025_deeplearning", "pretrain", split="train")
+    pretrain_dataset = load_dataset("tsbpp/fall2025_deeplearning", split="train")
     
-    print(f"Loaded {len(pretrain_dataset)} unlabeled images for pretraining")
+    # Optionally use a subset for faster iteration
+    if DATASET_SUBSET_SIZE is not None:
+        print(f"⚠️  Using SUBSET of {DATASET_SUBSET_SIZE:,} images for faster iteration")
+        pretrain_dataset = pretrain_dataset.select(range(min(DATASET_SUBSET_SIZE, len(pretrain_dataset))))
+    
+    print(f"Loaded {len(pretrain_dataset):,} unlabeled images for pretraining")
     print(f"Dataset features: {pretrain_dataset.features}")
     
-    # For evaluation, we still need CIFAR-10/STL-10 for k-NN evaluation during training
-    # (or you can skip k-NN evaluation during training and only evaluate on CUB-200)
-    print("\nLoading CIFAR-10 + STL-10 for k-NN evaluation during training...")
-    cifar10_root = '/tmp/cifar10'
-    cifar10_train = CIFAR10(root=cifar10_root, train=True, download=True, transform=None)
-    cifar10_test = CIFAR10(root=cifar10_root, train=False, download=True, transform=None)
+    # k-NN evaluation during training is optional
+    # Since eval_public is not available on HuggingFace, we can either:
+    # 1. Skip k-NN during training (recommended) - just track loss
+    # 2. Use CIFAR-10/STL-10 as a rough proxy (not ideal but gives some signal)
+    # Final evaluation should be done on the actual competition dataset (CUB-200 from testset_1)
     
-    stl10_root = '/tmp/stl10'
-    stl10_train = STL10(root=stl10_root, split='train', download=True, transform=None)
-    stl10_test = STL10(root=stl10_root, split='test', download=True, transform=None)
+    ENABLE_KNN_DURING_TRAINING = False  # Set to True to enable k-NN evaluation during training
     
-    from torch.utils.data import ConcatDataset
-    knn_train_ds = ConcatDataset([cifar10_train, stl10_train])
-    knn_test_ds = ConcatDataset([cifar10_test, stl10_test])
+    knn_train_loader = None
+    knn_test_loader = None
     
-    print(f"k-NN evaluation dataset: {len(knn_train_ds)} train, {len(knn_test_ds)} test samples")
+    if ENABLE_KNN_DURING_TRAINING:
+        print("\nLoading CIFAR-10 + STL-10 for k-NN evaluation during training...")
+        print("Note: This is just for monitoring. Final evaluation should be on competition dataset.")
+        cifar10_root = '/tmp/cifar10'
+        stl10_root = '/tmp/stl10'
+        
+        cifar10_train = CIFAR10(root=cifar10_root, train=True, download=True, transform=None)
+        cifar10_test = CIFAR10(root=cifar10_root, train=False, download=True, transform=None)
+        stl10_train = STL10(root=stl10_root, split='train', download=True, transform=None)
+        stl10_test = STL10(root=stl10_root, split='test', download=True, transform=None)
+        
+        from torch.utils.data import ConcatDataset
+        eval_train_ds = ConcatDataset([cifar10_train, stl10_train])
+        eval_test_ds = ConcatDataset([cifar10_test, stl10_test])
+        print(f"k-NN evaluation dataset: {len(eval_train_ds)} train, {len(eval_test_ds)} test samples")
+    else:
+        print("\nSkipping k-NN evaluation during training.")
+        print("Recommendation: Evaluate on competition dataset (CUB-200) after training completes.")
 
     # ----------------------------
     # DINO-style SSL dataset
     # ----------------------------
+    # OPTIMIZATION: Reduce num_local_crops to speed up training
+    # - 4 local crops: Standard DINO (slower, better quality)
+    # - 2 local crops: ~40% faster, slightly less effective
+    # - 1 local crop: ~60% faster, less effective
+    num_local_crops = 2  # Reduced from 4 to speed up training (set to 4 for best quality)
+    
     class DINODataset(torch.utils.data.Dataset):
-        def __init__(self, hf_dataset, image_size=96, num_local_crops=4):
+        def __init__(self, hf_dataset, image_size=96, num_local_crops=2):
             """
             Args:
                 hf_dataset: HuggingFace dataset (returns dict with 'image' key)
@@ -649,34 +679,44 @@ if __name__ == '__main__':
             return global_crop, local_crops
 
     # Create SSL dataset from HuggingFace pretraining data
-    ssl_ds_train = DINODataset(pretrain_dataset, image_size=image_size, num_local_crops=4)
+    ssl_ds_train = DINODataset(pretrain_dataset, image_size=image_size, num_local_crops=num_local_crops)
+    print(f"Using {num_local_crops} local crops per image (1 global + {num_local_crops} local = {num_local_crops+1} total crops)")
 
     # ----------------------------
-    # Evaluation datasets (k-NN)
+    # Evaluation datasets (k-NN) - Only if enabled
     # ----------------------------
-    # CIFAR-10 needs resizing, STL-10 doesn't
-    eval_transform_cifar = transforms.Compose([
-        transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    eval_transform_stl = transforms.Compose([
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    # For evaluation, we need to recreate the datasets with the eval transform
-    # Combine both CIFAR-10 and STL-10 for k-NN evaluation
-    knn_cifar10_train = CIFAR10(root=cifar10_root, train=True, download=False, transform=eval_transform_cifar)
-    knn_cifar10_test = CIFAR10(root=cifar10_root, train=False, download=False, transform=eval_transform_cifar)
-    knn_stl10_train = STL10(root=stl10_root, split='train', download=False, transform=eval_transform_stl)
-    knn_stl10_test = STL10(root=stl10_root, split='test', download=False, transform=eval_transform_stl)
-    
-    knn_train_ds = ConcatDataset([knn_cifar10_train, knn_stl10_train])
-    knn_test_ds = ConcatDataset([knn_cifar10_test, knn_stl10_test])
+    if ENABLE_KNN_DURING_TRAINING:
+        # Standard evaluation transform (no augmentation, just normalization)
+        eval_transform = transforms.Compose([
+            transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # CIFAR-10 needs resizing, STL-10 doesn't
+        eval_transform_cifar = transforms.Compose([
+            transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        eval_transform_stl = transforms.Compose([
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        knn_cifar10_train = CIFAR10(root=cifar10_root, train=True, download=False, transform=eval_transform_cifar)
+        knn_cifar10_test = CIFAR10(root=cifar10_root, train=False, download=False, transform=eval_transform_cifar)
+        knn_stl10_train = STL10(root=stl10_root, split='train', download=False, transform=eval_transform_stl)
+        knn_stl10_test = STL10(root=stl10_root, split='test', download=False, transform=eval_transform_stl)
+        
+        from torch.utils.data import ConcatDataset
+        knn_train_ds = ConcatDataset([knn_cifar10_train, knn_stl10_train])
+        knn_test_ds = ConcatDataset([knn_cifar10_test, knn_stl10_test])
+        print(f"Using CIFAR-10 + STL-10 for k-NN: {len(knn_train_ds)} train, {len(knn_test_ds)} test samples")
 
     # ----------------------------
     # DataLoaders
@@ -688,15 +728,30 @@ if __name__ == '__main__':
     # DINO authors: LR is most sensitive hyperparameter, scale with batch size
     # Smaller batch sizes need proportionally smaller learning rates
     batch_size = 32  # SMALL GPU VERSION: Reduced for limited GPU memory
+    # Try increasing to 64 or 128 if you have more GPU memory (faster training)
+    
+    # Calculate estimated epoch time
+    iterations_per_epoch = len(ssl_ds_train) / batch_size
+    estimated_hours = iterations_per_epoch * 0.8 / 3600  # Rough estimate: 0.8s per iteration
+    print(f"\n📊 Training info:")
+    print(f"   Batch size: {batch_size}")
+    print(f"   Iterations per epoch: ~{iterations_per_epoch:,.0f}")
+    print(f"   Estimated time per epoch: ~{estimated_hours:.1f} hours (varies by GPU)")
+    print(f"   Tip: Reduce DATASET_SUBSET_SIZE or num_local_crops to speed up")
+    
     train_loader = DataLoader(ssl_ds_train, batch_size=batch_size, shuffle=True,
                               num_workers=num_cores, pin_memory=True)
-    knn_train_loader = DataLoader(knn_train_ds, batch_size=batch_size, shuffle=False,
-                                  num_workers=num_cores, pin_memory=True)
-    knn_test_loader = DataLoader(knn_test_ds, batch_size=batch_size, shuffle=False,
-                                 num_workers=num_cores, pin_memory=True)
-
-    dataset_name = "Competition Pretraining Dataset (HuggingFace)"
-    print(f"{dataset_name} loaded. SSL Train: {len(ssl_ds_train)}, k-NN Train: {len(knn_train_ds)}, k-NN Test: {len(knn_test_ds)}")
+    
+    if ENABLE_KNN_DURING_TRAINING:
+        knn_train_loader = DataLoader(knn_train_ds, batch_size=batch_size, shuffle=False,
+                                      num_workers=num_cores, pin_memory=True)
+        knn_test_loader = DataLoader(knn_test_ds, batch_size=batch_size, shuffle=False,
+                                     num_workers=num_cores, pin_memory=True)
+        dataset_name = "Competition Pretraining Dataset (HuggingFace)"
+        print(f"{dataset_name} loaded. SSL Train: {len(ssl_ds_train)}, k-NN Train: {len(knn_train_ds)}, k-NN Test: {len(knn_test_ds)}")
+    else:
+        dataset_name = "Competition Pretraining Dataset (HuggingFace)"
+        print(f"{dataset_name} loaded. SSL Train: {len(ssl_ds_train)} (k-NN evaluation disabled during training)")
 
     ################################################################################
     ############################# MODEL SETUP ######################################
@@ -776,8 +831,8 @@ if __name__ == '__main__':
         save_dir="./checkpoints",  # Save checkpoints here
         save_freq=10,  # Save checkpoint every 10 epochs
         koleo_weight=0.1,  # DINOv2: KoLeo regularization weight (0.1 is a good default)
-        knn_train_loader=knn_train_loader,  # Pass k-NN loaders for evaluation
-        knn_test_loader=knn_test_loader,
+        knn_train_loader=knn_train_loader if ENABLE_KNN_DURING_TRAINING else None,  # Pass k-NN loaders only if enabled
+        knn_test_loader=knn_test_loader if ENABLE_KNN_DURING_TRAINING else None,
         resume_from=resume_from  # Resume from checkpoint if interrupted
     )
 

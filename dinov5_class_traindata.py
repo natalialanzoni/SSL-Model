@@ -17,8 +17,12 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 import numpy as np
 import os
+import sys
 import matplotlib.pyplot as plt  # For plotting loss and k-NN accuracy
 import copy
+import zipfile
+import glob
+from huggingface_hub import snapshot_download
 
 class DINOTarget:
     def __init__(self, dim, momentum=0.9, teacher_temp=0.07, device="cuda"):
@@ -529,19 +533,182 @@ if __name__ == '__main__':
     # 50k subset: ~20-30 min/epoch (good for testing hyperparameters)
     DATASET_SUBSET_SIZE = 50000  # None = full dataset, or set to e.g., 50000, 100000
     
-    print("Loading competition pretraining dataset from HuggingFace...")
-    print("Dataset: tsbpp/fall2025_deeplearning (pretrain split)")
+    # ======================================================================
+    # ENVIRONMENT DETECTION AND PATH SETUP
+    # ======================================================================
+    # Detect if running in Colab or on local GPU machine
+    is_colab = 'google.colab' in sys.modules or os.path.exists('/content/drive')
     
-    # Load the pretraining dataset (unlabeled)
-    pretrain_dataset = load_dataset("tsbpp/fall2025_deeplearning", split="train")
+    if is_colab:
+        # Colab: Use Google Drive for persistence across sessions
+        # Mount Drive if not already mounted
+        if not os.path.exists('/content/drive/MyDrive'):
+            try:
+                from google.colab import drive
+                drive.mount('/content/drive')
+            except ImportError:
+                print("⚠️  Google Drive not mounted. Please mount it manually.")
+        
+        DATASET_BASE_DIR = '/content/drive/MyDrive/dataset_cache'
+        ZIP_DIR = os.path.join(DATASET_BASE_DIR, 'zips')
+        UNZIPPED_DIR = os.path.join(DATASET_BASE_DIR, 'unzipped')
+        print("🌐 Running in Google Colab - using Google Drive for dataset storage")
+    else:
+        # Local GPU machine: Use local directory
+        DATASET_BASE_DIR = './dataset_cache'
+        ZIP_DIR = os.path.join(DATASET_BASE_DIR, 'zips')
+        UNZIPPED_DIR = os.path.join(DATASET_BASE_DIR, 'unzipped')
+        print("💻 Running on local GPU machine - using local directory for dataset storage")
     
-    # Optionally use a subset for faster iteration
-    if DATASET_SUBSET_SIZE is not None:
-        print(f"⚠️  Using SUBSET of {DATASET_SUBSET_SIZE:,} images for faster iteration")
-        pretrain_dataset = pretrain_dataset.select(range(min(DATASET_SUBSET_SIZE, len(pretrain_dataset))))
+    os.makedirs(ZIP_DIR, exist_ok=True)
+    os.makedirs(UNZIPPED_DIR, exist_ok=True)
     
-    print(f"Loaded {len(pretrain_dataset):,} unlabeled images for pretraining")
-    print(f"Dataset features: {pretrain_dataset.features}")
+    # ======================================================================
+    # DOWNLOAD DATASET USING SNAPSHOT_DOWNLOAD
+    # ======================================================================
+    print("\n" + "="*60)
+    print("Step 1: Downloading dataset ZIP files...")
+    print("="*60)
+    
+    dataset_repo = "tsbpp/fall2025_deeplearning"
+    
+    # Check if ZIP files already exist
+    existing_zips = glob.glob(os.path.join(ZIP_DIR, "*.zip"))
+    if existing_zips:
+        print(f"✓ Found {len(existing_zips)} existing ZIP files in {ZIP_DIR}")
+        print("  Skipping download (files already exist)")
+    else:
+        print(f"Downloading dataset from {dataset_repo} to {ZIP_DIR}...")
+        print("  This may take 10-20 minutes depending on your connection...")
+        try:
+            snapshot_download(
+                repo_id=dataset_repo,
+                local_dir=ZIP_DIR,
+                repo_type="dataset",
+                ignore_patterns=["*.md", "*.txt"]  # Skip README files
+            )
+            print("✓ Download complete!")
+        except Exception as e:
+            print(f"⚠️  Error during download: {e}")
+            print("  Will try to use existing files or fall back to load_dataset()...")
+    
+    # ======================================================================
+    # UNZIP FILES
+    # ======================================================================
+    print("\n" + "="*60)
+    print("Step 2: Unzipping files...")
+    print("="*60)
+    
+    # Find all ZIP files
+    zip_files = glob.glob(os.path.join(ZIP_DIR, "*.zip"))
+    
+    # Track if we're using unzipped images or fallback to load_dataset
+    use_unzipped = False
+    
+    if not zip_files:
+        print("⚠️  No ZIP files found! Falling back to load_dataset()...")
+        use_unzipped = False
+    else:
+        use_unzipped = True
+        # Check if already unzipped (look for image files in unzipped directory)
+        existing_images = glob.glob(os.path.join(UNZIPPED_DIR, "**", "*.jpg"), recursive=True)
+        existing_images += glob.glob(os.path.join(UNZIPPED_DIR, "**", "*.png"), recursive=True)
+        existing_images += glob.glob(os.path.join(UNZIPPED_DIR, "**", "*.jpeg"), recursive=True)
+        
+        if existing_images:
+            print(f"✓ Found {len(existing_images):,} existing unzipped images in {UNZIPPED_DIR}")
+            print("  Skipping unzip (files already extracted)")
+        else:
+            print(f"Unzipping {len(zip_files)} ZIP files to {UNZIPPED_DIR}...")
+            print("  This will take approximately 1 hour, but only needs to be done once!")
+            
+            for i, zip_path in enumerate(zip_files, 1):
+                zip_name = os.path.basename(zip_path)
+                print(f"  [{i}/{len(zip_files)}] Unzipping {zip_name}...")
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(UNZIPPED_DIR)
+                    print(f"    ✓ {zip_name} extracted")
+                except Exception as e:
+                    print(f"    ⚠️  Error unzipping {zip_name}: {e}")
+            
+            print("✓ Unzip complete!")
+        
+        # ======================================================================
+        # CREATE CUSTOM DATASET LOADER FOR UNZIPPED IMAGES
+        # ======================================================================
+        print("\n" + "="*60)
+        print("Step 3: Loading images from unzipped directory...")
+        print("="*60)
+        
+        class ImageFolderDataset(torch.utils.data.Dataset):
+            """Custom dataset that loads images from a directory of unzipped images."""
+            def __init__(self, image_dir, image_size=96):
+                """
+                Args:
+                    image_dir: Directory containing unzipped images
+                    image_size: Target image size (for validation)
+                """
+                self.image_dir = Path(image_dir)
+                self.image_size = image_size
+                
+                # Find all image files recursively
+                image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+                self.image_paths = []
+                for ext in image_extensions:
+                    self.image_paths.extend(self.image_dir.rglob(ext))
+                
+                # Sort for reproducibility
+                self.image_paths = sorted(self.image_paths)
+                
+                print(f"  Found {len(self.image_paths):,} images in {image_dir}")
+            
+            def __len__(self):
+                return len(self.image_paths)
+            
+            def __getitem__(self, idx):
+                """Return PIL Image (compatible with existing DINODataset)."""
+                img_path = self.image_paths[idx]
+                try:
+                    img = Image.open(img_path).convert('RGB')
+                    return {'image': img}  # Return dict format like HuggingFace dataset
+                except Exception as e:
+                    print(f"⚠️  Error loading {img_path}: {e}")
+                    # Return a black image as fallback
+                    return {'image': Image.new('RGB', (self.image_size, self.image_size), (0, 0, 0))}
+        
+        # Create dataset from unzipped images
+        pretrain_dataset = ImageFolderDataset(UNZIPPED_DIR, image_size=image_size)
+        
+        # Optionally use a subset for faster iteration
+        if DATASET_SUBSET_SIZE is not None and len(pretrain_dataset) > DATASET_SUBSET_SIZE:
+            print(f"⚠️  Using SUBSET of {DATASET_SUBSET_SIZE:,} images for faster iteration")
+            # Create a subset by selecting first N images
+            class SubsetDataset(torch.utils.data.Dataset):
+                def __init__(self, dataset, indices):
+                    self.dataset = dataset
+                    self.indices = indices
+                def __len__(self):
+                    return len(self.indices)
+                def __getitem__(self, idx):
+                    return self.dataset[self.indices[idx]]
+            
+            subset_indices = list(range(min(DATASET_SUBSET_SIZE, len(pretrain_dataset))))
+            pretrain_dataset = SubsetDataset(pretrain_dataset, subset_indices)
+        
+        print(f"✓ Loaded {len(pretrain_dataset):,} images from unzipped directory")
+        print(f"  Dataset location: {UNZIPPED_DIR}")
+    
+    # Fallback to load_dataset if unzipping failed or no ZIP files
+    if not use_unzipped:
+        print("\n" + "="*60)
+        print("Using load_dataset() fallback method...")
+        print("="*60)
+        pretrain_dataset = load_dataset(dataset_repo, split="train")
+        if DATASET_SUBSET_SIZE is not None:
+            print(f"⚠️  Using SUBSET of {DATASET_SUBSET_SIZE:,} images for faster iteration")
+            pretrain_dataset = pretrain_dataset.select(range(min(DATASET_SUBSET_SIZE, len(pretrain_dataset))))
+        print(f"Loaded {len(pretrain_dataset):,} images using load_dataset()")
 
     # ----------------------------
     # DINO-style SSL dataset
@@ -618,8 +785,12 @@ if __name__ == '__main__':
     # ----------------------------
     # DataLoaders
     # ----------------------------
-    num_cores = os.cpu_count() or 2
-    print(f"Using {num_cores} workers for DataLoaders.")
+    # IMPORTANT: Use 8-12 workers for parallel I/O and augmentation
+    # This is critical for HuggingFace datasets which load from ZIP files
+    # More workers = better parallelization of image loading and transforms
+    num_workers = 12  # Recommended: 8-12 for Colab/GPU machines with good CPUs
+    # Alternative: num_workers = min(12, os.cpu_count() or 2)  # Use up to 12 or available cores
+    print(f"Using {num_workers} workers for DataLoaders (critical for fast I/O from ZIP files).")
 
     # SMALL GPU VERSION: Reduced batch size for limited GPU memory
     # DINO authors: LR is most sensitive hyperparameter, scale with batch size
@@ -637,7 +808,7 @@ if __name__ == '__main__':
     print(f"   Tip: Reduce DATASET_SUBSET_SIZE or num_local_crops to speed up")
     
     train_loader = DataLoader(ssl_ds_train, batch_size=batch_size, shuffle=True,
-                              num_workers=num_cores, pin_memory=True)
+                              num_workers=num_workers, pin_memory=True)
 
     dataset_name = "Competition Pretraining Dataset (HuggingFace)"
     print(f"{dataset_name} loaded. SSL Train: {len(ssl_ds_train)} images")

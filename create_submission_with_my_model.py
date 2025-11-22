@@ -25,7 +25,8 @@ import argparse
 import copy
 
 # Import your DINO model classes
-from dinov5_small import VisionTransformer, DINOHead, load_checkpoint
+# Update this import to match the file you trained with
+from dinov5_class_traindata import VisionTransformer, DINOHead, load_checkpoint
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
@@ -293,13 +294,23 @@ def train_knn_classifier(train_features, train_labels, val_features, val_labels,
     
     classifier.fit(train_features, train_labels)
     
-    # Evaluate
-    train_acc = classifier.score(train_features, train_labels)
+    # Evaluate on validation set
+    # NOTE: Train accuracy on k-NN is always ~100% because:
+    # - Each training sample finds itself (distance=0) as one of the k nearest neighbors
+    # - With weights='distance', the query point itself gets infinite weight (1/0)
+    # - This is expected behavior and not meaningful - only val/test accuracy matters
     val_acc = classifier.score(val_features, val_labels)
     
     print(f"\nKNN Results:")
-    print(f"  Train Accuracy: {train_acc:.4f} ({train_acc*100:.2f}%)")
     print(f"  Val Accuracy: {val_acc:.4f} ({val_acc*100:.2f}%)")
+    print(f"  Note: Train accuracy not shown (k-NN always gets ~100% on training data)")
+    
+    if val_acc < 0.1:
+        print(f"\n⚠️  WARNING: Very low validation accuracy ({val_acc*100:.2f}%)!")
+        print(f"  This suggests:")
+        print(f"    1. Model may not have learned good features yet")
+        print(f"    2. Possible domain mismatch (trained on different data)")
+        print(f"    3. Model may need more training epochs")
     
     return classifier
 
